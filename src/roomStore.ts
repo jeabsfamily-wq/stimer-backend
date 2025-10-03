@@ -1,5 +1,6 @@
-import type { Room, StationSlot } from './types.js';
-import { genCode } from './utils/uuid.js';
+// backend/src/roomStore.ts
+import type { Room, StationSlot } from "./types.js";
+import { genCode } from "./utils/uuid.js";
 
 const rooms = new Map<string, Room>();
 
@@ -57,11 +58,14 @@ export function createRoom(
   const room: Room = {
     code,
     centralClientId,
-    state: 'WAITING',
+    state: "WAITING",
     stationsCount,
     roundDurationSec,
     stations: makeStations(stationsCount),
     bindings: new Map(),
+    warned30: false,
+    warned60: false,
+    pendingCompaction: false,
   };
   rooms.set(code, room);
   return room;
@@ -97,27 +101,6 @@ export function serialize(room: Room) {
   };
 }
 
-export function claimStation(room: Room, clientId: string, stationId: number) {
-  if (stationId < 1 || stationId > room.stationsCount)
-    throw new Error('E_INVALID_PAYLOAD');
-  const slot = room.stations.get(stationId)!;
-  if (slot.ownerClientId && slot.ownerClientId !== clientId)
-    throw new Error('E_STATION_TAKEN');
-  // single active binding: kick previous slot of this client, if any
-  const prev = room.bindings.get(clientId);
-  if (prev && prev !== stationId) {
-    const p = room.stations.get(prev);
-    if (p) {
-      p.ownerClientId = undefined;
-      p.ready = false;
-      p.connected = false;
-    }
-  }
-  slot.ownerClientId = clientId;
-  slot.connected = true;
-  room.bindings.set(clientId, stationId);
-}
-
 export function setReady(room: Room, clientId: string, ready: boolean) {
   const sid = room.bindings.get(clientId);
   if (!sid) return;
@@ -139,11 +122,11 @@ export function updateConfig(
   stationsCount: number,
   roundDurationSec: number
 ) {
-  if (room.state !== 'WAITING') throw new Error('E_BAD_STATE');
+  if (room.state !== "WAITING") throw new Error("E_BAD_STATE");
   // guard reducing count below claimed
   for (let i = stationsCount + 1; i <= room.stationsCount; i++) {
     const s = room.stations.get(i);
-    if (s?.ownerClientId) throw new Error('E_STATIONS_IN_USE');
+    if (s?.ownerClientId) throw new Error("E_STATIONS_IN_USE");
   }
   room.stationsCount = stationsCount;
   for (let i = stationsCount + 1; i <= 200; i++) room.stations.delete(i);
@@ -154,18 +137,18 @@ export function updateConfig(
 }
 
 export function startRound(room: Room) {
-  if (room.state !== 'WAITING') throw new Error('E_BAD_STATE');
-  if (!allClaimedAndReady(room)) throw new Error('E_BAD_STATE');
-  room.state = 'RUNNING';
+  if (room.state !== "WAITING") throw new Error("E_BAD_STATE");
+  if (!allClaimedAndReady(room)) throw new Error("E_BAD_STATE");
+  room.state = "RUNNING";
   room.startedAt = Date.now();
   room.timeLeft = room.roundDurationSec;
   room.warned30 = false;
+  room.warned60 = false;
 }
 
-// Pause/Stop the running round (keep timeLeft)
 export function stopRound(room: Room) {
-  if (room.state !== 'RUNNING') throw new Error('E_BAD_STATE');
-  room.state = 'ENDED';
+  if (room.state !== "RUNNING") throw new Error("E_BAD_STATE");
+  room.state = "ENDED";
   if (room.interval) {
     clearInterval(room.interval);
     room.interval = undefined;
@@ -177,28 +160,36 @@ export function stopRound(room: Room) {
   );
 }
 
-// Resume from paused (ENDED) when timeLeft > 0
 export function resumeRound(room: Room) {
-  if (room.state !== 'ENDED') throw new Error('E_BAD_STATE');
+  if (room.state !== "ENDED") throw new Error("E_BAD_STATE");
   const tl = room.timeLeft ?? 0;
-  if (tl <= 0) throw new Error('E_BAD_STATE');
-  room.state = 'RUNNING';
+  if (tl <= 0) throw new Error("E_BAD_STATE");
+  room.state = "RUNNING";
   // Recompute startedAt so that: roundDurationSec - elapsed == timeLeft
   room.startedAt = Date.now() - (room.roundDurationSec - tl) * 1000;
-  // If resuming with <=30s left, consider already warned
   room.warned30 = tl <= 30;
+  room.warned60 = tl <= 60;
 }
 
-export function tick(room: Room, onWarn30: () => void, onTimeUp: () => void) {
-  if (room.state !== 'RUNNING' || room.startedAt == null) return;
+export function tick(
+  room: Room,
+  onWarn30: () => void,
+  onWarn60: () => void,
+  onTimeUp: () => void
+) {
+  if (room.state !== "RUNNING" || room.startedAt == null) return;
   const elapsed = Math.floor((Date.now() - room.startedAt) / 1000);
   room.timeLeft = Math.max(0, room.roundDurationSec - elapsed);
+  if (!room.warned60 && room.roundDurationSec >= 60 && room.timeLeft === 60) {
+    room.warned60 = true;
+    onWarn60();
+  }
   if (!room.warned30 && room.timeLeft === 30 && room.roundDurationSec > 30) {
     room.warned30 = true;
     onWarn30();
   }
   if (room.timeLeft === 0) {
-    room.state = 'ENDED';
+    room.state = "ENDED";
     clearInterval(room.interval);
     room.interval = undefined;
     onTimeUp();
@@ -206,18 +197,117 @@ export function tick(room: Room, onWarn30: () => void, onTimeUp: () => void) {
 }
 
 export function resetToWaiting(room: Room) {
+  // after ENDED -> WAITING, clear ready
   for (const s of room.stations.values()) s.ready = false;
-  room.state = 'WAITING';
+  room.state = "WAITING";
   room.startedAt = undefined;
   room.timeLeft = undefined;
   room.warned30 = false;
+  room.warned60 = false;
+  maybeApplyPendingCompaction(room);
 }
 
 export function deleteRoom(code: string) {
   const r = rooms.get(code);
-  if (!r) throw new Error('E_ROOM_NOT_FOUND');
+  if (!r) throw new Error("E_ROOM_NOT_FOUND");
   if (r.interval) clearInterval(r.interval);
   rooms.delete(code);
+}
+
+// === Compaction helpers ===
+
+// ลดเฉพาะ "หาง" ว่างที่ต่อเนื่อง ในโหมด WAITING (ไม่ renumber คนอื่น)
+export function tailCompactIfWaiting(room: Room) {
+  if (room.state !== "WAITING") return;
+  let newCount = room.stationsCount;
+  while (newCount > 0) {
+    const s = room.stations.get(newCount);
+    if (s && (s.ownerClientId || s.ready || s.connected)) break;
+    newCount--;
+  }
+  if (newCount < room.stationsCount) {
+    for (let i = newCount + 1; i <= room.stationsCount; i++)
+      room.stations.delete(i);
+    room.stationsCount = newCount;
+  }
+}
+
+// ลบ stationId แล้วเลื่อน id ถัด ๆ ลงมา 1 ขั้นในโหมด WAITING
+// ส่งกลับ mapping ของการเลื่อนสำหรับอัปเดต bindings ภายนอก/แจ้ง client
+export function renumberCompactIfWaiting(
+  room: Room,
+  removedId: number
+): Array<{ clientId: string; oldId: number; newId: number }> {
+  const renumbered: Array<{
+    clientId: string;
+    oldId: number;
+    newId: number;
+  }> = [];
+  if (room.state !== "WAITING") return renumbered;
+  if (removedId < 1 || removedId > room.stationsCount) return renumbered;
+
+  // เคลียร์ช่องที่ลบ
+  const removed = room.stations.get(removedId);
+  if (removed) {
+    removed.ownerClientId = undefined;
+    removed.connected = false;
+    removed.ready = false;
+  }
+
+  // เลื่อนช่วง [removedId+1..stationsCount] ลงมา
+  for (let i = removedId; i < room.stationsCount; i++) {
+    const src =
+      room.stations.get(i + 1) ??
+      ({ id: i + 1, ready: false, connected: false } as StationSlot);
+    const dst: StationSlot =
+      room.stations.get(i) ??
+      ({ id: i, ready: false, connected: false } as StationSlot);
+
+    // copy state จาก src -> dst
+    dst.id = i;
+    dst.ownerClientId = src.ownerClientId;
+    dst.connected = src.connected;
+    dst.ready = src.ready;
+
+    room.stations.set(i, dst);
+
+    // อัปเดต bindings: clientId -> stationId
+    if (src.ownerClientId) {
+      const cid = src.ownerClientId;
+      const oldId = i + 1;
+      const newId = i;
+
+      // room.bindings: Map<clientId, stationId>
+      const cur = room.bindings.get(cid);
+      if (cur === oldId) room.bindings.set(cid, newId);
+
+      renumbered.push({ clientId: cid, oldId, newId });
+    }
+  }
+
+  // ลบตัวสุดท้ายเดิม
+  room.stations.delete(room.stationsCount);
+  room.stationsCount = Math.max(0, room.stationsCount - 1);
+
+  return renumbered;
+}
+
+// ใช้เมื่อกลับสู่ WAITING
+export function maybeApplyPendingCompaction(room: Room) {
+  if (room.state !== "WAITING") return;
+  if (!room.pendingCompaction) return;
+  tailCompactIfWaiting(room);
+  room.pendingCompaction = false;
+}
+
+// ทำให้รอบจบทันที (ไว้ใช้กับ skip)
+export function immediateEnd(room: Room) {
+  if (room.interval) {
+    clearInterval(room.interval);
+    room.interval = undefined;
+  }
+  room.timeLeft = 0;
+  room.state = "ENDED";
 }
 
 // compatibility helpers for socket.ts

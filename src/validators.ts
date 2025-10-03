@@ -30,3 +30,7 @@ export const deleteRoomSchema = z.object({
 export const simpleCodeSchema = z.object({
   code: z.string().min(3).max(12),
 });
+
+
+
+export type SimpleCodeInput = z.infer<typeof simpleCodeSchema>;
